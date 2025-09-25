@@ -1,0 +1,5 @@
+{
+    "cmake.generator" : "Unix Makefiles",
+    "sonarlint.pathToCompileCommands" : "build/compile_commands.json",
+    "sonarlint.analysisExcludesStandalone" : "extern/**"
+}
