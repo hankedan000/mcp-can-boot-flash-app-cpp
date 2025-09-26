@@ -337,8 +337,9 @@ private:
     bool verbose_ = false;
     MemoryMap memMap_;
     MemoryMap::iterator memMapIter_;
-    size_t memMapCurrentIdx_ = 0u;
-    uint64_t memMapTotalBytes_ = 0u;
+    size_t memMapCurrentIdx_ = 0u;    // byte idx within current block
+    size_t memMapProgressBytes_ = 0u; // bytes we've processed relative to total
+    size_t memMapTotalBytes_ = 0u;    // total bytes in hex file
     uint32_t curAddr_ = 0u;
     std::vector<uint8_t> readData_;
     std::array<uint8_t, 3> deviceSignature_;
@@ -506,17 +507,18 @@ private:
         }
     }
 
-    void handleStateFlashing(const uint8_t* d, uint8_t cmd) {
+    void handleStateFlashing(const uint8_t* data, uint8_t cmd) {
         if (cmd == CMD_FLASH_DATA_ERROR) {
             std::cerr << "Flash data error!\n";
         } else if (cmd == CMD_FLASH_ADDRESS_ERROR) {
             std::cerr << "Flash address error!\n";
         } else if (cmd == CMD_FLASH_READY) {
-            uint8_t byteCount = (d[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
-            progressIncrement(byteCount);
+            uint8_t byteCount = (data[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
+            progressUpdate();
             curAddr_ += byteCount;
             memMapCurrentIdx_ += byteCount;
-            onFlashReady(d);
+            memMapProgressBytes_ += byteCount;
+            onFlashReady(data);
         } else if (cmd == CMD_START_APP) {
             auto elapsed = duration_cast<milliseconds>(steady_clock::now() - flashStartTs_).count();
             std::cout << "Flash done in " << elapsed << " ms. MCU starting app.\n";
@@ -544,7 +546,8 @@ private:
                 return;
             }
             if (opt_.verbose) std::cerr << "Got flash data for " << std::hex << curAddr_ << std::dec << "\n";
-            progressIncrement(byteCount);
+            memMapProgressBytes_ += byteCount;
+            progressUpdate();
             if (doVerify_) {
                 for (int i=0;i<byteCount;i++) {
                     uint8_t expected = 0xFF;
@@ -603,6 +606,7 @@ private:
             memMapIter_ = next(memMapIter_);
             if (memMapIter_ == memMap_.end()) {
                 progressStop();
+                memMapProgressBytes_ = 0u;
                 std::cout << "All data transmitted. Finalizing ...\n";
                 if (doVerify_) {
                     state_ = State::STATE_READING;
@@ -615,11 +619,9 @@ private:
                 return;
             }
             // set up first block
-            memMapCurrentIdx_ = 0;
+            memMapCurrentIdx_ = 0u;
             curAddr_ = memMapIter_->first;
-            if (memMapTotalBytes_ > 0) {
-                progressStart((uint64_t)memMapTotalBytes_);
-            }
+            progressUpdate();
         }
 
         if (curAddr_ != curAddrRemote) {
@@ -684,19 +686,12 @@ private:
         sendStartApp();
     }
 
-    void progressStart(uint64_t total) {
-        // simple textual progress
+    void progressUpdate() {
         if (!opt_.verbose) {
-            std::cout << "Progress: 0 / " << total << "\r" << std::flush;
+            std::cout << "Progress: " << memMapProgressBytes_ << " / " << memMapTotalBytes_ << "\r" << std::flush;
         }
     }
-    void progressIncrement(uint64_t inc) {
-        static uint64_t progress = 0;
-        progress += inc;
-        if (!opt_.verbose) {
-            std::cout << "Progress: " << progress << " / " << memMapTotalBytes_ << "\r" << std::flush;
-        }
-    }
+
     void progressStop() {
         if (!opt_.verbose) std::cout << std::endl;
     }
