@@ -1,4 +1,6 @@
-add_executable(application
-	application.cpp)
-target_link_libraries(application
-	argparse::argparse)
+add_executable(flash-app
+	flash-app.cpp)
+# target_link_libraries(flash-app
+# 	argparse::argparse)
+
+install(TARGETS flash-app)
