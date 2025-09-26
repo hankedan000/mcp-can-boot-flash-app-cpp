@@ -109,7 +109,16 @@ static std::string hex_u8(uint8_t v) {
 
 class IntelHex {
 public:
+    enum struct RecordType {
+        DATA = 0x00,
+        END_OF_FILE = 0x01,
+        EXT_SEG_ADDR = 0x02,
+        EXT_LIN_ADDR = 0x04
+    };
+
     static MemoryMap parseFile(const std::string& filename) {
+        constexpr size_t MIN_RECORD_LINE_CHARS = 11u;// 11 = 1  + 2   + 4    + 2       ... + 2
+                                                     //     ':' + len + addr + rectype ... + checksum
         std::istream* in;
         std::ifstream fin;
         if (filename == "-") {
@@ -125,9 +134,15 @@ public:
         MemoryMap map;
         std::string line;
         uint32_t upperAddr = 0;
+        std::vector<uint8_t> data;// used to parse record data
+        data.reserve(256u);
         while (std::getline(*in, line)) {
-            if (line.empty()) continue;
-            if (line[0] != ':') throw std::runtime_error("Invalid HEX record (no ':')");
+            if (line.length() < MIN_RECORD_LINE_CHARS) {
+                continue;
+            }
+            if (line[0] != ':') {
+                throw std::runtime_error("Invalid HEX record (no ':')");
+            }
             // parse
             auto hexbyte = [](char c)->int {
                 if (c >= '0' && c <= '9') return c - '0';
@@ -141,31 +156,34 @@ public:
                 if (hi < 0 || lo < 0) throw std::runtime_error("Invalid hex digit");
                 return (uint8_t)((hi<<4) | lo);
             };
-            int len = parse8(1);
-            uint16_t addr = (parse8(3) << 8) | parse8(5);
-            uint8_t rectype = parse8(7);
-            std::vector<uint8_t> data;
-            for (int i=0;i<len;i++) {
-                data.push_back(parse8(9 + i*2));
+            const uint8_t len = parse8(1);
+            const uint16_t addr = (parse8(3) << 8) | parse8(5);
+            const auto rectype = static_cast<RecordType>(parse8(7));
+            if (line.length() < (MIN_RECORD_LINE_CHARS + len)) {
+                throw std::runtime_error(
+                    "Invalid HEX record (not enough data char for record"
+                    " len " + std::to_string(len) + ")");
+            }
+            data.resize(len);
+            for (uint8_t i=0;i<len;i++) {
+                data[i] = parse8(9 + i*2);
             }
             // checksum skip check for brevity (could be validated)
             switch (rectype) {
-                case 0x00: { // data
-                    uint32_t fullAddr = upperAddr + addr;
-                    auto &blk = map[fullAddr];
-                    // append data to block starting at fullAddr. For simplicity, place as a block keyed by fullAddr.
-                    blk = data;
+                case RecordType::DATA: {
+                    const uint32_t fullAddr = upperAddr + addr;
+                    map[fullAddr] = data; // append data to block starting at fullAddr. For simplicity, place as a block keyed by fullAddr.
                     break;
                 }
-                case 0x01: // EOF
+                case RecordType::END_OF_FILE:
                     break;
-                case 0x02: { // Extended segment address
-                    if (data.size() < 2) throw std::runtime_error("Invalid ext segment");
+                case RecordType::EXT_SEG_ADDR: {
+                    if (data.size() < 2) throw std::runtime_error("Invalid ext segment addr");
                     upperAddr = ((uint32_t)data[0] << 8 | data[1]) << 4;
                     break;
                 }
-                case 0x04: { // Extended linear address
-                    if (data.size() < 2) throw std::runtime_error("Invalid ext linear");
+                case RecordType::EXT_LIN_ADDR: {
+                    if (data.size() < 2) throw std::runtime_error("Invalid ext linear addr");
                     upperAddr = ((uint32_t)data[0] << 8 | data[1]) << 16;
                     break;
                 }
@@ -197,38 +215,38 @@ public:
             uint32_t upper = (addr >> 16) & 0xFFFF;
             if (upper != lastUpper) {
                 // write extended linear address
-                writeRecord(*out, 0x04, 0x0000, { (uint8_t)(upper >> 8), (uint8_t)(upper & 0xFF) });
+                writeRecord(*out, RecordType::EXT_LIN_ADDR, 0x0000, { (uint8_t)(upper >> 8), (uint8_t)(upper & 0xFF) });
                 lastUpper = upper;
             }
             uint16_t recAddr = addr & 0xFFFF;
             // write data in chunks up to 16 bytes
             size_t idx = 0;
             while (idx < data.size()) {
-                size_t chunk = std::min<size_t>(16, data.size() - idx);
-                std::vector<uint8_t> chunkv(data.begin() + idx, data.begin() + idx + chunk);
-                writeRecord(*out, 0x00, recAddr + idx, chunkv);
-                idx += chunk;
+                const size_t chunkSize = std::min<size_t>(16u, data.size() - idx);
+                std::vector<uint8_t> chunk(data.begin() + idx, data.begin() + idx + chunkSize);
+                writeRecord(*out, RecordType::DATA, recAddr + idx, chunk);
+                idx += chunkSize;
             }
         }
-        writeRecord(*out, 0x01, 0x0000, {}); // EOF
+        writeRecord(*out, RecordType::END_OF_FILE, 0x0000, {});
     }
 
 private:
-    static void writeRecord(std::ostream& out, uint8_t type, uint16_t addr, const std::vector<uint8_t>& data) {
-        uint8_t len = (uint8_t)data.size();
+    static void writeRecord(std::ostream& out, RecordType recType, uint16_t addr, const std::vector<uint8_t>& data) {
+        const auto len = static_cast<uint8_t>(data.size());
         uint8_t csum = 0;
         csum += len;
         csum += (addr >> 8) & 0xFF;
         csum += addr & 0xFF;
-        csum += type;
+        csum += static_cast<uint8_t>(recType);
         for (uint8_t d : data) csum += d;
         csum = (~csum) + 1;
         std::ostringstream line;
         line << ":" << std::uppercase << std::hex << std::setw(2) << std::setfill('0') << (int)len;
-        line << std::setw(4) << (int)addr;
-        line << std::setw(2) << (int)type;
-        for (uint8_t d : data) line << std::setw(2) << (int)d;
-        line << std::setw(2) << (int)csum;
+        line << std::setw(4) << static_cast<unsigned int>(addr);
+        line << std::setw(2) << static_cast<unsigned int>(recType);
+        for (uint8_t d : data) line << std::setw(2) << static_cast<unsigned int>(d);
+        line << std::setw(2) << static_cast<unsigned int>(csum);
         out << line.str() << std::endl;
     }
 };
@@ -242,6 +260,7 @@ static uint64_t totalBytesInMemMap(const MemoryMap& mem) {
 
 class FlashApp {
 public:
+    explicit
     FlashApp(const Options& o)
         : opt_(o)
     {
@@ -289,6 +308,12 @@ public:
     ~FlashApp() {
         cleanup();
     }
+
+    // abide by rule of 5: prevent copying, but permit move semantics
+    FlashApp(const FlashApp & other) = delete;
+    FlashApp(FlashApp && other) noexcept = default;
+    FlashApp & operator=(const FlashApp & other) = delete;
+    FlashApp & operator=(FlashApp && other) noexcept = default;
 
     void run() {
         fd_set readfds;
@@ -424,40 +449,40 @@ private:
         }
         if (fid != opt_.canIdMcu) return;
 
-        const uint8_t* d = frame.data;
-        uint16_t mcuid = (d[CAN_DATA_BYTE_MCU_ID_MSB] << 8) | d[CAN_DATA_BYTE_MCU_ID_LSB];
+        const uint8_t* data = frame.data;
+        const uint16_t mcuid = (data[CAN_DATA_BYTE_MCU_ID_MSB] << 8) | data[CAN_DATA_BYTE_MCU_ID_LSB];
         if (mcuid != opt_.mcuid) return;
 
-        uint8_t cmd = d[CAN_DATA_BYTE_CMD];
+        const uint8_t cmd = data[CAN_DATA_BYTE_CMD];
 
         switch (state_) {
             case State::STATE_INIT:
-                handleStateInit(d, cmd);
+                handleStateInit(data, cmd);
                 break;
             case State::STATE_FLASHING:
-                handleStateFlashing(d, cmd);
+                handleStateFlashing(data, cmd);
                 break;
             case State::STATE_READING:
-                handleStateReading(d, cmd);
+                handleStateReading(data, cmd);
                 break;
         }
     }
 
-    void handleStateInit(const uint8_t* d, uint8_t cmd) {
+    void handleStateInit(const uint8_t* data, const uint8_t cmd) {
         if (cmd == CMD_BOOTLOADER_START) {
             // check signature
-            if (d[4] != deviceSignature_[0] || d[5] != deviceSignature_[1] || d[6] != deviceSignature_[2]) {
+            if (data[4] != deviceSignature_[0] || data[5] != deviceSignature_[1] || data[6] != deviceSignature_[2]) {
                 std::cerr << "Error: Got bootloader start message but device signature mismatched!\n";
                 std::cerr << "Expected: " << hex_u8(deviceSignature_[0]) << " " << hex_u8(deviceSignature_[1]) << " " << hex_u8(deviceSignature_[2])
-                                    << " got: " << hex_u8(d[4]) << " " << hex_u8(d[5]) << " " << hex_u8(d[6]) << "\n";
+                                    << " got: " << hex_u8(data[4]) << " " << hex_u8(data[5]) << " " << hex_u8(data[6]) << "\n";
                 return;
             }
             // check bootloader version
-            if (d[7] != BOOTLOADER_CMD_VERSION) {
+            if (data[7] != BOOTLOADER_CMD_VERSION) {
                 if (opt_.force) {
                     std::cerr << "WARNING: Bootloader version mismatch, forced.\n";
                 } else {
-                    std::cerr << "ERROR: Bootloader version mismatch (MCU " << (int)d[7] << " vs app " << (int)BOOTLOADER_CMD_VERSION << "). Use -F to force.\n";
+                    std::cerr << "ERROR: Bootloader version mismatch (MCU " << (int)data[7] << " vs app " << (int)BOOTLOADER_CMD_VERSION << "). Use -F to force.\n";
                     return;
                 }
             }
@@ -480,11 +505,11 @@ private:
             } else {
                 std::cout << "Got flash ready message, begin flashing ...\n";
                 state_ = State::STATE_FLASHING;
-                onFlashReady(d);
+                onFlashReady(data);
             }
         } else if (cmd == CMD_FLASH_ADDRESS_ERROR) {
             if (doRead_) {
-                uint32_t flashendBL = (d[4] << 24) | (d[5] << 16) | (d[6] << 8) | d[7];
+                uint32_t flashendBL = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
                 uint32_t progSize = flashendBL + 1;
                 uint32_t blSize = (deviceFlashSize_) - progSize;
                 std::cout << "Bootloader size: " << blSize << " bytes\n";
@@ -509,7 +534,7 @@ private:
         }
     }
 
-    void handleStateFlashing(const uint8_t* data, uint8_t cmd) {
+    void handleStateFlashing(const uint8_t* data, const uint8_t cmd) {
         if (cmd == CMD_FLASH_DATA_ERROR) {
             std::cerr << "Flash data error!\n";
         } else if (cmd == CMD_FLASH_ADDRESS_ERROR) {
@@ -530,7 +555,7 @@ private:
         }
     }
 
-    void handleStateReading(const uint8_t* d, uint8_t cmd) {
+    void handleStateReading(const uint8_t* data, const uint8_t cmd) {
         if (cmd == CMD_FLASH_DONE_VERIFY) {
             std::cout << "Start reading flash to verify ...\n";
             // prepare for verify: reset iterators
@@ -540,25 +565,31 @@ private:
             // request read
             sendRead(curAddr_);
         } else if (cmd == CMD_FLASH_READ_DATA) {
-            uint8_t byteCount = (d[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
-            uint8_t addrPart = d[CAN_DATA_BYTE_LEN_AND_ADDR] & 0b00011111;
+            const uint8_t byteCount = (data[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
+            const uint8_t addrPart = data[CAN_DATA_BYTE_LEN_AND_ADDR] & 0b00011111;
             if (((curAddr_) & 0b00011111) != addrPart) {
                 std::cerr << "Unexpected address of read data from MCU!\n";
                 sendStartApp();
                 return;
             }
-            if (opt_.verbose) std::cerr << "Got flash data for " << std::hex << curAddr_ << std::dec << "\n";
+            if (opt_.verbose) {
+                std::cerr << "Got flash data for"
+                    " 0x" << std::hex << curAddr_ << std::dec <<
+                    " (" << static_cast<unsigned int>(byteCount) << " bytes)\n";
+            }
             progressBytes_ += byteCount;
             progressUpdate();
             if (doVerify_) {
-                for (int i=0;i<byteCount;i++) {
+                for (uint8_t i=0;i<byteCount;i++) {
                     uint8_t expected = 0xFF;
                     if (memMapIter_ != memMap_.end()) {
-                        auto &vec = memMapIter_->second;
-                        if (memMapCurrentIdx_ < vec.size()) expected = vec[memMapCurrentIdx_];
+                        const auto &vec = memMapIter_->second;
+                        if (memMapCurrentIdx_ < vec.size()) {
+                            expected = vec[memMapCurrentIdx_];
+                        }
                     }
-                    if (expected != d[4+i]) {
-                        std::cerr << "ERROR: Verify failed at " << std::hex << curAddr_ << std::dec << "\n";
+                    if (expected != data[4+i]) {
+                        std::cerr << "ERROR: Verify failed at 0x" << std::hex << curAddr_ << std::dec << "\n";
                         sendStartApp();
                         return;
                     }
@@ -576,7 +607,7 @@ private:
             } else {
                 // collecting read
                 for (int i=0;i<byteCount;i++) {
-                    readData_.push_back(d[4+i]);
+                    readData_.push_back(data[4+i]);
                     curAddr_++;
                 }
                 if (opt_.readMax > 0 && curAddr_ > (uint32_t)opt_.readMax) {
@@ -601,8 +632,8 @@ private:
         }
     }
 
-    void onFlashReady(const uint8_t* msgData) {
-        uint32_t curAddrRemote = msgData[7] + (msgData[6] << 8) + (msgData[5] << 16) + (msgData[4] << 24);
+    void onFlashReady(const uint8_t* data) {
+        uint32_t curAddrRemote = data[7] + (data[6] << 8) + (data[5] << 16) + (data[4] << 24);
         if (memMapIter_ == memMap_.end() || memMapIter_->second.empty() || memMapCurrentIdx_ >= memMapIter_->second.size()) {
             // move to next key
             memMapIter_ = next(memMapIter_);
@@ -633,23 +664,23 @@ private:
         }
 
         // prepare data with up to 4 bytes
-        std::vector<uint8_t> data(8,0);
-        data[0] = mcuIdBytes_[0];
-        data[1] = mcuIdBytes_[1];
-        data[2] = CMD_FLASH_DATA;
+        std::vector<uint8_t> outData(8,0);
+        outData[0] = mcuIdBytes_[0];
+        outData[1] = mcuIdBytes_[1];
+        outData[2] = CMD_FLASH_DATA;
         int dataBytes = 0;
         auto &vec = memMapIter_->second;
         for (int i=0;i<4;i++) {
             if (memMapCurrentIdx_ + i >= vec.size()) break;
-            data[4+i] = vec[memMapCurrentIdx_ + i];
+            outData[4+i] = vec[memMapCurrentIdx_ + i];
             dataBytes++;
         }
-        data[3] = (dataBytes << 5) | (curAddr_ & 0b00011111);
+        outData[3] = (dataBytes << 5) | (curAddr_ & 0b00011111);
         if (opt_.verbose) std::cerr << "Sending flash data for 0x" << std::hex << curAddr_ << std::dec << " (" << dataBytes << " bytes)\n";
-        sendFrame(opt_.canIdRemote, data, !opt_.sff);
+        sendFrame(opt_.canIdRemote, outData, !opt_.sff);
     }
 
-    void sendSetFlashAddress(uint32_t addr) {
+    void sendSetFlashAddress(const uint32_t addr) {
         std::vector<uint8_t> data = { mcuIdBytes_[0], mcuIdBytes_[1], (uint8_t)CMD_FLASH_SET_ADDRESS, 0,
                                                                     (uint8_t)((addr >> 24) & 0xFF),
                                                                     (uint8_t)((addr >> 16) & 0xFF),
@@ -658,7 +689,7 @@ private:
         sendFrame(opt_.canIdRemote, data, !opt_.sff);
     }
 
-    void sendRead(uint32_t addr) {
+    void sendRead(const uint32_t addr) {
         std::vector<uint8_t> data = { mcuIdBytes_[0], mcuIdBytes_[1], (uint8_t)CMD_FLASH_READ, 0,
                                                                     (uint8_t)((addr >> 24) & 0xFF),
                                                                     (uint8_t)((addr >> 16) & 0xFF),
