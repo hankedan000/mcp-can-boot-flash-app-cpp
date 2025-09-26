@@ -85,7 +85,7 @@ struct Options {
     bool doErase = false;
     bool doVerify = true;
     bool doRead = false;
-    long readMax = -1;
+    uint32_t readMax = 0;
     bool force = false;
     std::string resetMsg;
     uint32_t canIdMcu = CAN_ID_MCU_TO_REMOTE_DEFAULT;
@@ -261,26 +261,23 @@ static uint64_t totalBytesInMemMap(const MemoryMap& mem) {
 class FlashApp {
 public:
     explicit
-    FlashApp(const Options& o)
-        : opt_(o)
+    FlashApp(const Options& optsIn)
+        : opt_(optsIn)
     {
         // mcu id bytes
         mcuIdBytes_[0] = (uint8_t)((opt_.mcuid >> 8) & 0xFF);
         mcuIdBytes_[1] = (uint8_t)(opt_.mcuid & 0xFF);
-        doRead_ = opt_.doRead;
-        doErase_ = opt_.doErase;
-        doVerify_ = opt_.doVerify;
         deviceFlashSize_ = 0;
         loadDeviceInfo(opt_.partno);
-        if ( ! doRead_) {
+        if ( ! opt_.doRead) {
             // read hex file
             memMap_ = IntelHex::parseFile(opt_.file);
-        } else {
-            memMap_.clear();
+            progressTotalBytes_ = totalBytesInMemMap(memMap_);
+            remainingBytes_ = progressTotalBytes_;
+            opt_.readMax = progressTotalBytes_;
         }
         memMapIter_ = memMap_.begin();
         memMapCurrentIdx_ = 0;
-        progressTotalBytes_ = totalBytesInMemMap(memMap_);
 
         curAddr_ = 0x0000;
         readData_.clear();
@@ -353,14 +350,10 @@ public:
     }
 
 private:
-    const Options opt_;
+    Options opt_;
     int canSock_ = -1;
     State state_ = State::STATE_INIT;
     std::array<uint8_t, 2> mcuIdBytes_ = {0u, 0u};
-    bool doErase_ = false;
-    bool doRead_ = false;
-    bool doVerify_ = false;
-    bool verbose_ = false;
     MemoryMap memMap_;
     MemoryMap::iterator memMapIter_;
     size_t memMapCurrentIdx_ = 0u;   // byte idx within current block
@@ -368,6 +361,7 @@ private:
     size_t progressTotalBytes_ = 0u; // total bytes in hex file
     uint32_t curAddr_ = 0u;
     std::vector<uint8_t> readData_;
+    size_t remainingBytes_ = 0u; // bytes remaining in read operation
     std::array<uint8_t, 3> deviceSignature_;
     size_t deviceFlashSize_ = 0u;
     steady_clock::time_point flashStartTs_;
@@ -493,35 +487,33 @@ private:
                                                                         deviceSignature_[0], deviceSignature_[1], deviceSignature_[2], 0x00 };
             sendFrame(opt_.canIdRemote, data, !opt_.sff);
         } else if (cmd == CMD_FLASH_READY) {
-            if (doRead_) {
+            if (opt_.doRead) {
                 std::cout << "Querying bootloader size ...\n";
                 // set address to 0xFFFFFFFF to provoke address error -> get FLASHEND_BL
                 sendSetFlashAddress(0xFFFFFFFF);
-            } else if (doErase_) {
+            } else if (opt_.doErase) {
                 std::cout << "Got flash ready message, erasing flash ...\n";
                 std::vector<uint8_t> data = {mcuIdBytes_[0], mcuIdBytes_[1], (uint8_t)CMD_FLASH_ERASE, 0,0,0,0,0};
                 sendFrame(opt_.canIdRemote, data, !opt_.sff);
-                doErase_ = false;
+                opt_.doErase = false;
             } else {
                 std::cout << "Got flash ready message, begin flashing ...\n";
                 state_ = State::STATE_FLASHING;
                 onFlashReady(data);
             }
         } else if (cmd == CMD_FLASH_ADDRESS_ERROR) {
-            if (doRead_) {
+            if (opt_.doRead) {
                 uint32_t flashendBL = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
                 uint32_t progSize = flashendBL + 1;
                 uint32_t blSize = (deviceFlashSize_) - progSize;
                 std::cout << "Bootloader size: " << blSize << " bytes\n";
-                progressTotalBytes_ = progSize;
-                if (opt_.readMax > 0) {
-                    if ((uint32_t)opt_.readMax > progSize) {
-                        std::cerr << "WARNING: read size of " << opt_.readMax <<
-                            " exceeds program memory size " << progSize << "\n";
-                    } else {
-                        progressTotalBytes_ = (uint32_t)opt_.readMax;// user specified max read address
-                    }
+                progressTotalBytes_ = opt_.readMax;
+                if (opt_.readMax > progSize) {
+                    std::cerr << "WARNING: read size of " << opt_.readMax <<
+                        " exceeds program memory size " << progSize << ". Using program size instead.\n";
+                    progressTotalBytes_ = progSize;
                 }
+                remainingBytes_ = progressTotalBytes_;
                 std::cout << "Reading " << progressTotalBytes_ << " bytes\n";
                 state_ = State::STATE_READING;
                 // request read at addr 0
@@ -565,7 +557,12 @@ private:
             // request read
             sendRead(curAddr_);
         } else if (cmd == CMD_FLASH_READ_DATA) {
-            const uint8_t byteCount = (data[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
+            uint8_t byteCount = (data[CAN_DATA_BYTE_LEN_AND_ADDR] >> 5);
+            if (byteCount > remainingBytes_) {
+                // bootloader can return more bytes than we needed in the
+                // last block, so truncate to remainingBytes_
+                byteCount = static_cast<uint8_t>(remainingBytes_);
+            }
             const uint8_t addrPart = data[CAN_DATA_BYTE_LEN_AND_ADDR] & 0b00011111;
             if (((curAddr_) & 0b00011111) != addrPart) {
                 std::cerr << "Unexpected address of read data from MCU!\n";
@@ -578,9 +575,10 @@ private:
                     " (" << static_cast<unsigned int>(byteCount) << " bytes)\n";
             }
             progressBytes_ += byteCount;
+            remainingBytes_ -= byteCount;
             progressUpdate();
-            if (doVerify_) {
-                for (uint8_t i=0;i<byteCount;i++) {
+            if (opt_.doVerify) {
+                for (uint32_t i=0;i<byteCount;i++) {
                     uint8_t expected = 0xFF;
                     if (memMapIter_ != memMap_.end()) {
                         const auto &vec = memMapIter_->second;
@@ -599,25 +597,33 @@ private:
                     if (memMapIter_ != memMap_.end() && memMapCurrentIdx_ >= memMapIter_->second.size()) {
                         memMapIter_++;
                         memMapCurrentIdx_ = 0;
-                        if (memMapIter_ != memMap_.end()) curAddr_ = memMapIter_->first;
+                        if (memMapIter_ != memMap_.end()) {
+                            curAddr_ = memMapIter_->first;
+                        }
                     }
+                }
+                if (remainingBytes_ == 0) {
+                    progressStop();
+                    std::cout << "Flash and verify done.\n";
+                    sendStartApp();
+                    return;
                 }
                 // request next read
                 sendRead(curAddr_);
             } else {
                 // collecting read
-                for (int i=0;i<byteCount;i++) {
+                for (uint8_t i=0;i<byteCount;i++) {
                     readData_.push_back(data[4+i]);
                     curAddr_++;
                 }
-                if (opt_.readMax > 0 && curAddr_ > (uint32_t)opt_.readMax) {
+                if (remainingBytes_ == 0) {
                     readDone();
                     return;
                 }
                 sendRead(curAddr_);
             }
         } else if (cmd == CMD_FLASH_READ_ADDRESS_ERROR) {
-            if (doVerify_) {
+            if (opt_.doVerify) {
                 std::cerr << "ERROR: Reading flash failed during verify!\n";
                 sendStartApp();
                 return;
@@ -638,10 +644,12 @@ private:
             // move to next key
             memMapIter_ = next(memMapIter_);
             if (memMapIter_ == memMap_.end()) {
+                progressBytes_ = progressTotalBytes_;
+                progressUpdate();
                 progressStop();
                 progressBytes_ = 0u;
                 std::cout << "All data transmitted. Finalizing ...\n";
-                if (doVerify_) {
+                if (opt_.doVerify) {
                     state_ = State::STATE_READING;
                     std::vector<uint8_t> data = { mcuIdBytes_[0], mcuIdBytes_[1], (uint8_t)CMD_FLASH_DONE_VERIFY, 0,0,0,0,0 };
                     sendFrame(opt_.canIdRemote, data, !opt_.sff);
@@ -745,15 +753,6 @@ private:
         } else {
             deviceSignature_[0]=0; deviceSignature_[1]=0; deviceSignature_[2]=0; deviceFlashSize_ = 0;
         }
-    }
-
-    void sendStartAppAndExit() {
-        sendStartApp();
-        exitClean(0);
-    }
-
-    void sendStartAppSafe() {
-        sendStartApp();
     }
 
     void cleanup() {
