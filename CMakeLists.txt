@@ -1,5 +1,10 @@
 cmake_minimum_required (VERSION 3.5)
 
+# Set a default build type if none was specified
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "")
+endif()
+
 project(mcp_can_boot_flash_app VERSION 1.0.0)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

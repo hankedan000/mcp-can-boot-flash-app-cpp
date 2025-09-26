@@ -35,6 +35,7 @@
 #include <map>
 #include <sstream>
 #include <string>
+#include <tqdm.h>
 #include <vector>
 
 using namespace std::chrono;
@@ -280,7 +281,6 @@ public:
         memMapCurrentIdx_ = 0;
 
         curAddr_ = 0x0000;
-        readData_.clear();
 
         openCan(opt_.iface);
 
@@ -366,6 +366,7 @@ private:
     size_t deviceFlashSize_ = 0u;
     steady_clock::time_point flashStartTs_;
     steady_clock::time_point lastPing_;
+    tqdm tqdmBar_;
 
     void openCan(const std::string& iface) {
         canSock_ = socket(PF_CAN, SOCK_RAW, CAN_RAW);
@@ -514,6 +515,7 @@ private:
                     progressTotalBytes_ = progSize;
                 }
                 remainingBytes_ = progressTotalBytes_;
+                readData_.reserve(progressBytes_);
                 std::cout << "Reading " << progressTotalBytes_ << " bytes\n";
                 state_ = State::STATE_READING;
                 // request read at addr 0
@@ -536,7 +538,6 @@ private:
             progressUpdate();
             curAddr_ += byteCount;
             memMapCurrentIdx_ += byteCount;
-            progressBytes_ += byteCount;
             onFlashReady(data);
         } else if (cmd == CMD_START_APP) {
             auto elapsed = duration_cast<milliseconds>(steady_clock::now() - flashStartTs_).count();
@@ -572,7 +573,9 @@ private:
             if (opt_.verbose) {
                 std::cerr << "Got flash data for"
                     " 0x" << std::hex << curAddr_ << std::dec <<
-                    " (" << static_cast<unsigned int>(byteCount) << " bytes)\n";
+                    " (" << static_cast<unsigned int>(byteCount) << " bytes; " <<
+                    progressBytes_ << "/" << progressTotalBytes_ << "; " <<
+                    remainingBytes_ << " remaining)\n";
             }
             progressBytes_ += byteCount;
             remainingBytes_ -= byteCount;
@@ -644,12 +647,12 @@ private:
             // move to next key
             memMapIter_ = next(memMapIter_);
             if (memMapIter_ == memMap_.end()) {
-                progressBytes_ = progressTotalBytes_;
                 progressUpdate();
                 progressStop();
-                progressBytes_ = 0u;
                 std::cout << "All data transmitted. Finalizing ...\n";
                 if (opt_.doVerify) {
+                    progressBytes_ = 0u;
+                    remainingBytes_ = progressTotalBytes_;
                     state_ = State::STATE_READING;
                     std::vector<uint8_t> data = { mcuIdBytes_[0], mcuIdBytes_[1], (uint8_t)CMD_FLASH_DONE_VERIFY, 0,0,0,0,0 };
                     sendFrame(opt_.canIdRemote, data, !opt_.sff);
@@ -683,8 +686,15 @@ private:
             outData[4+i] = vec[memMapCurrentIdx_ + i];
             dataBytes++;
         }
+        progressBytes_ += dataBytes;
+        remainingBytes_ -= dataBytes;
         outData[3] = (dataBytes << 5) | (curAddr_ & 0b00011111);
-        if (opt_.verbose) std::cerr << "Sending flash data for 0x" << std::hex << curAddr_ << std::dec << " (" << dataBytes << " bytes)\n";
+        if (opt_.verbose) {
+            std::cerr << "Sending flash data for 0x" << std::hex << curAddr_ << std::dec <<
+            " (" << dataBytes << " bytes; " <<
+            progressBytes_ << "/" << progressTotalBytes_ << "; " <<
+            remainingBytes_ << " remaining)\n";
+        }
         sendFrame(opt_.canIdRemote, outData, !opt_.sff);
     }
 
@@ -729,13 +739,14 @@ private:
 
     void progressUpdate() {
         if ( ! opt_.verbose) {
-            std::cout << "Progress: " << progressBytes_ << " / " << progressTotalBytes_ << "\r" << std::flush;
+            tqdmBar_.progress(progressBytes_, progressTotalBytes_);
         }
     }
 
     void progressStop() {
         if ( ! opt_.verbose) {
-            std::cout << std::endl;
+            tqdmBar_.finish();
+            tqdmBar_.reset();
         }
     }
 
