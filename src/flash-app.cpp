@@ -116,7 +116,9 @@ public:
             in = &std::cin;
         } else {
             fin.open(filename, std::ios::in);
-            if (!fin) throw std::runtime_error("Cannot open input HEX file");
+            if ( ! fin) {
+                throw std::runtime_error("Cannot open input HEX file");
+            }
             in = &fin;
         }
 
@@ -181,8 +183,10 @@ public:
         if (filename == "-") {
             out = &std::cout;
         } else {
-            fout.open(filename, std::ios::out);
-            if (!fout) throw std::runtime_error("Cannot open output file");
+            fout.open(filename, std::ios::out | std::ios::trunc);
+            if ( ! fout) {
+                throw std::runtime_error("Cannot open output file");
+            }
             out = &fout;
         }
         // Very simple: emit linear extended address records for each block base
@@ -249,25 +253,22 @@ public:
         doVerify_ = opt_.doVerify;
         deviceFlashSize_ = 0;
         loadDeviceInfo(opt_.partno);
-        if (!doRead_) {
+        if ( ! doRead_) {
             // read hex file
             memMap_ = IntelHex::parseFile(opt_.file);
         } else {
             memMap_.clear();
-            if (opt_.file != "-" && access(opt_.file.c_str(), F_OK) == 0) {
-                throw std::runtime_error("Output file already exists");
-            }
         }
         memMapIter_ = memMap_.begin();
         memMapCurrentIdx_ = 0;
-        memMapTotalBytes_ = totalBytesInMemMap(memMap_);
+        progressTotalBytes_ = totalBytesInMemMap(memMap_);
 
         curAddr_ = 0x0000;
         readData_.clear();
 
         openCan(opt_.iface);
 
-        if (!opt_.resetMsg.empty()) {
+        if ( ! opt_.resetMsg.empty()) {
             sendReset(opt_.resetMsg);
             if (opt_.verbose) std::cerr << "Reset message sent\n";
         }
@@ -291,7 +292,7 @@ public:
 
     void run() {
         fd_set readfds;
-        while (!g_terminate) {
+        while ( ! g_terminate) {
             FD_ZERO(&readfds);
             FD_SET(canSock_, &readfds);
 
@@ -337,9 +338,9 @@ private:
     bool verbose_ = false;
     MemoryMap memMap_;
     MemoryMap::iterator memMapIter_;
-    size_t memMapCurrentIdx_ = 0u;    // byte idx within current block
-    size_t memMapProgressBytes_ = 0u; // bytes we've processed relative to total
-    size_t memMapTotalBytes_ = 0u;    // total bytes in hex file
+    size_t memMapCurrentIdx_ = 0u;   // byte idx within current block
+    size_t progressBytes_ = 0u;      // bytes we've processed relative to total
+    size_t progressTotalBytes_ = 0u; // total bytes in hex file
     uint32_t curAddr_ = 0u;
     std::vector<uint8_t> readData_;
     std::array<uint8_t, 3> deviceSignature_;
@@ -487,15 +488,16 @@ private:
                 uint32_t progSize = flashendBL + 1;
                 uint32_t blSize = (deviceFlashSize_) - progSize;
                 std::cout << "Bootloader size: " << blSize << " bytes\n";
-                uint32_t readSizeBytes = progSize;
+                progressTotalBytes_ = progSize;
                 if (opt_.readMax > 0) {
-                    if ((uint32_t)opt_.readMax >= progSize) {
-                        std::cerr << "WARNING: read size exceeds program memory size\n";
+                    if ((uint32_t)opt_.readMax > progSize) {
+                        std::cerr << "WARNING: read size of " << opt_.readMax <<
+                            " exceeds program memory size " << progSize << "\n";
                     } else {
-                        readSizeBytes = (uint32_t)opt_.readMax;
+                        progressTotalBytes_ = (uint32_t)opt_.readMax;// user specified max read address
                     }
                 }
-                std::cout << "Reading " << readSizeBytes << " bytes\n";
+                std::cout << "Reading " << progressTotalBytes_ << " bytes\n";
                 state_ = State::STATE_READING;
                 // request read at addr 0
                 sendRead(curAddr_);
@@ -517,7 +519,7 @@ private:
             progressUpdate();
             curAddr_ += byteCount;
             memMapCurrentIdx_ += byteCount;
-            memMapProgressBytes_ += byteCount;
+            progressBytes_ += byteCount;
             onFlashReady(data);
         } else if (cmd == CMD_START_APP) {
             auto elapsed = duration_cast<milliseconds>(steady_clock::now() - flashStartTs_).count();
@@ -546,7 +548,7 @@ private:
                 return;
             }
             if (opt_.verbose) std::cerr << "Got flash data for " << std::hex << curAddr_ << std::dec << "\n";
-            memMapProgressBytes_ += byteCount;
+            progressBytes_ += byteCount;
             progressUpdate();
             if (doVerify_) {
                 for (int i=0;i<byteCount;i++) {
@@ -606,7 +608,7 @@ private:
             memMapIter_ = next(memMapIter_);
             if (memMapIter_ == memMap_.end()) {
                 progressStop();
-                memMapProgressBytes_ = 0u;
+                progressBytes_ = 0u;
                 std::cout << "All data transmitted. Finalizing ...\n";
                 if (doVerify_) {
                     state_ = State::STATE_READING;
@@ -687,13 +689,15 @@ private:
     }
 
     void progressUpdate() {
-        if (!opt_.verbose) {
-            std::cout << "Progress: " << memMapProgressBytes_ << " / " << memMapTotalBytes_ << "\r" << std::flush;
+        if ( ! opt_.verbose) {
+            std::cout << "Progress: " << progressBytes_ << " / " << progressTotalBytes_ << "\r" << std::flush;
         }
     }
 
     void progressStop() {
-        if (!opt_.verbose) std::cout << std::endl;
+        if ( ! opt_.verbose) {
+            std::cout << std::endl;
+        }
     }
 
     void loadDeviceInfo(const std::string& partno) {
